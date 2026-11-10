@@ -1,4 +1,4 @@
-name = "wisp-server-workers"
+name = "nexus-wisp-worker"
 main = "build/worker/shim.mjs"
 compatibility_date = "2023-12-01"
 
