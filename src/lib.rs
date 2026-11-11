@@ -4,12 +4,14 @@ use std::sync::Arc;
 use futures_util::lock::Mutex;
 use regex::Regex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+
 use wisp_mux::{
     packet::{CloseReason, ConnectPacket, StreamType},
     stream::MuxStream,
     ws::TransportWrite,
     ServerMux, WispError,
 };
+
 use worker::{
     console_log,
     console_warn,
@@ -27,7 +29,7 @@ fn to_worker(val: WispError) -> Error {
     Error::RustError(val.to_string())
 }
 
-// Handle each incoming Wisp stream
+// Handle incoming Wisp TCP streams
 async fn stream_handler(
     packet: ConnectPacket,
     stream: MuxStream<impl TransportWrite>,
@@ -58,7 +60,9 @@ async fn stream_handler(
                     );
 
                     stream
-                        .close(CloseReason::ServerStreamInvalidInfo)
+                        .close(
+                            CloseReason::ServerStreamInvalidInfo
+                        )
                         .await
                         .map_err(to_worker)?;
 
@@ -88,6 +92,7 @@ async fn stream_handler(
                         b
                     );
                 }
+
                 Err(error) => {
                     console_warn!(
                         "TCP relay failed for {}:{}: {:?}",
@@ -107,7 +112,9 @@ async fn stream_handler(
             );
 
             stream
-                .close(CloseReason::ServerStreamInvalidInfo)
+                .close(
+                    CloseReason::ServerStreamInvalidInfo
+                )
                 .await
                 .map_err(to_worker)?;
         }
@@ -216,8 +223,6 @@ async fn ws_handler(
                     packet.host
                 );
 
-                // Do not create a connection
-                // after rejecting the host.
                 continue;
             }
         }
@@ -259,6 +264,17 @@ async fn main(
     env: Env,
     _ctx: Context,
 ) -> Result<Response> {
+
+    // NEW: Temporary health-check endpoint
+    // Does not affect existing WebSocket connections.
+    if req.path() == "/health" {
+        console_log!("HEALTH CHECK REACHED");
+
+        return Response::ok(
+            "WISP_WORKER_HEALTH_OK_V1"
+        );
+    }
+
     let upgrade = req
         .headers()
         .get("Upgrade")?
@@ -291,7 +307,11 @@ async fn main(
 
     spawn_local(async move {
         if let Err(error) =
-            ws_handler(server.as_ref().clone(), env).await
+            ws_handler(
+                server.as_ref().clone(),
+                env
+            )
+            .await
         {
             console_warn!(
                 "WebSocket handler failed: {:?}",
