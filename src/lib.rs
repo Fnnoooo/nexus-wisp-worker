@@ -1,124 +1,304 @@
+
 use std::sync::Arc;
 
 use futures_util::lock::Mutex;
 use regex::Regex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use wisp_mux::{
-	packet::{CloseReason, ConnectPacket, StreamType},
-	stream::MuxStream,
-	ws::TransportWrite,
-	ServerMux, WispError,
+    packet::{CloseReason, ConnectPacket, StreamType},
+    stream::MuxStream,
+    ws::TransportWrite,
+    ServerMux, WispError,
 };
 use worker::{
-	console_log, console_warn, event, wasm_bindgen_futures::spawn_local,
-	worker_sys::web_sys::WebSocket, Context, Env, Error, Headers, Request, Response, ResponseBody,
-	Result, Socket, WebSocketPair,
+    console_log,
+    console_warn,
+    event,
+    wasm_bindgen_futures::spawn_local,
+    worker_sys::web_sys::WebSocket,
+    Context, Env, Error, Headers, Request, Response,
+    ResponseBody, Result, Socket, WebSocketPair,
 };
+
 use ws_wrapper::WebSocketWrapper;
 mod ws_wrapper;
 
 fn to_worker(val: WispError) -> Error {
-	Error::RustError(val.to_string())
+    Error::RustError(val.to_string())
 }
 
+// Handle each incoming Wisp stream
 async fn stream_handler(
-	packet: ConnectPacket,
-	stream: MuxStream<impl TransportWrite>,
+    packet: ConnectPacket,
+    stream: MuxStream<impl TransportWrite>,
 ) -> Result<()> {
-	match packet.stream_type {
-		StreamType::Tcp => {
-			let mut socket = Socket::builder().connect(packet.host, packet.port)?;
-			let mut wisp_socket = stream.into_async_rw().compat();
-			tokio::io::copy_bidirectional(&mut socket, &mut wisp_socket).await?;
-		}
-		StreamType::Udp | StreamType::Other(_) => stream
-			.close(CloseReason::ServerStreamInvalidInfo)
-			.await
-			.map_err(to_worker)?,
-	}
-	Ok(())
+    match packet.stream_type {
+        StreamType::Tcp => {
+            console_log!(
+                "TCP connect requested: {}:{}",
+                packet.host,
+                packet.port
+            );
+
+            let mut socket = match Socket::builder()
+                .connect(packet.host.clone(), packet.port)
+            {
+                Ok(socket) => {
+                    console_log!(
+                        "TCP socket created: {}:{}",
+                        packet.host,
+                        packet.port
+                    );
+                    socket
+                }
+                Err(error) => {
+                    console_warn!(
+                        "TCP socket creation failed: {:?}",
+                        error
+                    );
+
+                    stream
+                        .close(CloseReason::ServerStreamInvalidInfo)
+                        .await
+                        .map_err(to_worker)?;
+
+                    return Err(error);
+                }
+            };
+
+            let mut wisp_socket =
+                stream.into_async_rw().compat();
+
+            console_log!(
+                "Starting TCP relay for {}:{}",
+                packet.host,
+                packet.port
+            );
+
+            match tokio::io::copy_bidirectional(
+                &mut socket,
+                &mut wisp_socket,
+            )
+            .await
+            {
+                Ok((a, b)) => {
+                    console_log!(
+                        "TCP relay finished: {} bytes / {} bytes",
+                        a,
+                        b
+                    );
+                }
+                Err(error) => {
+                    console_warn!(
+                        "TCP relay failed for {}:{}: {:?}",
+                        packet.host,
+                        packet.port,
+                        error
+                    );
+
+                    return Err(error.into());
+                }
+            }
+        }
+
+        StreamType::Udp | StreamType::Other(_) => {
+            console_warn!(
+                "Rejected unsupported stream type"
+            );
+
+            stream
+                .close(CloseReason::ServerStreamInvalidInfo)
+                .await
+                .map_err(to_worker)?;
+        }
+    }
+
+    Ok(())
 }
 
-async fn ws_handler(ws: WebSocket, env: Env) -> Result<()> {
-	let (tx, rx) = WebSocketWrapper::connect(ws);
+// Handle WebSocket connections
+async fn ws_handler(
+    ws: WebSocket,
+    env: Env,
+) -> Result<()> {
+    let (tx, rx) = WebSocketWrapper::connect(ws);
 
-	console_log!("Accepted websocket");
+    console_log!("Accepted websocket");
 
-	let (server, fut) = ServerMux::new(rx.into_read(), tx.into_write(), 128, None)
-		.await
-		.map_err(to_worker)?
-		.with_no_required_extensions();
+    let (server, fut) = ServerMux::new(
+        rx.into_read(),
+        tx.into_write(),
+        128,
+        None,
+    )
+    .await
+    .map_err(to_worker)?
+    .with_no_required_extensions();
 
-	console_log!("Created mux");
+    console_log!("Created Wisp mux");
 
-	spawn_local(async move {
-		console_warn!("Mux future result: {:?}", fut.await);
-	});
+    spawn_local(async move {
+        console_warn!(
+            "Mux future result: {:?}",
+            fut.await
+        );
+    });
 
-	let connected_vec = Arc::new(Mutex::new(Vec::new()));
+    let connected_vec =
+        Arc::new(Mutex::new(Vec::new()));
 
-	let allowed_host_regex = env.var("allowed_host_regex").ok().and_then(|x| {
-		let regex = Regex::try_from(x.to_string()).ok();
-		if regex.is_none() {
-			console_warn!("allowed_host_regex was invalid. continuing without allowed_host_regex");
-		}
-		regex
-	});
+    let allowed_host_regex =
+        env.var("allowed_host_regex").ok().and_then(|x| {
+            let regex =
+                Regex::try_from(x.to_string()).ok();
 
-	while let Some((packet, stream)) = server.wait_for_stream().await {
-		let connected_vec = connected_vec.clone();
-		let stream_ident = (packet.host.clone(), packet.port);
-		let mut locked = connected_vec.lock().await;
-		if locked.contains(&stream_ident) || locked.len() >= 6 {
-			stream
-				.close(CloseReason::ServerStreamThrottled)
-				.await
-				.map_err(to_worker)?;
-			console_warn!("Blocked stream creation because one stream for that combo was already created or too many sockets were created");
-			continue;
-		}
-		if let Some(ref regex) = allowed_host_regex {
-			if !regex.is_match(&packet.host) {
-				stream
-					.close(CloseReason::ServerStreamBlockedAddress)
-					.await
-					.map_err(to_worker)?;
-			}
-		}
-		locked.push(stream_ident.clone());
-		drop(locked);
-		console_log!("Created stream");
-		spawn_local(async move {
-			console_warn!(
-				"Stream handle future result: {:?}",
-				stream_handler(packet, stream).await
-			);
-			connected_vec.lock().await.retain(|x| *x != stream_ident);
-		})
-	}
+            if regex.is_none() {
+                console_warn!(
+                    "Invalid allowed_host_regex"
+                );
+            }
 
-	Ok(())
+            regex
+        });
+
+    while let Some((packet, stream)) =
+        server.wait_for_stream().await
+    {
+        console_log!(
+            "Incoming Wisp stream: {}:{}",
+            packet.host,
+            packet.port
+        );
+
+        let connected_vec =
+            connected_vec.clone();
+
+        let stream_ident =
+            (packet.host.clone(), packet.port);
+
+        let mut locked =
+            connected_vec.lock().await;
+
+        // Limit simultaneous connections
+        if locked.contains(&stream_ident)
+            || locked.len() >= 6
+        {
+            stream
+                .close(
+                    CloseReason::ServerStreamThrottled
+                )
+                .await
+                .map_err(to_worker)?;
+
+            console_warn!(
+                "Stream throttled: {}:{}",
+                packet.host,
+                packet.port
+            );
+
+            continue;
+        }
+
+        // Check allowed hosts
+        if let Some(ref regex) =
+            allowed_host_regex
+        {
+            if !regex.is_match(&packet.host) {
+                stream
+                    .close(
+                        CloseReason::ServerStreamBlockedAddress
+                    )
+                    .await
+                    .map_err(to_worker)?;
+
+                console_warn!(
+                    "Blocked disallowed host: {}",
+                    packet.host
+                );
+
+                // Do not create a connection
+                // after rejecting the host.
+                continue;
+            }
+        }
+
+        locked.push(stream_ident.clone());
+        drop(locked);
+
+        console_log!(
+            "Creating TCP stream: {}:{}",
+            packet.host,
+            packet.port
+        );
+
+        spawn_local(async move {
+            let result =
+                stream_handler(packet, stream).await;
+
+            console_warn!(
+                "Stream handler finished: {:?}",
+                result
+            );
+
+            connected_vec
+                .lock()
+                .await
+                .retain(|x| *x != stream_ident);
+        });
+    }
+
+    console_warn!("Wisp stream loop ended");
+
+    Ok(())
 }
 
+// Cloudflare Worker entry point
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-	if req.headers().get("Upgrade")?.unwrap_or_default() != "websocket" {
-		return Ok(
-			Response::from_body(ResponseBody::Body(include_bytes!("426.jpg").to_vec()))?
-				.with_status(426)
-				.with_headers(Headers::from_iter(
-					[("Content-Type", "image/jpeg")].into_iter(),
-				)),
-		);
-	}
+async fn main(
+    req: Request,
+    env: Env,
+    _ctx: Context,
+) -> Result<Response> {
+    let upgrade = req
+        .headers()
+        .get("Upgrade")?
+        .unwrap_or_default();
 
-	let pair = WebSocketPair::new()?;
-	pair.server.accept()?;
-	let server = pair.server;
+    if !upgrade.eq_ignore_ascii_case("websocket") {
+        return Ok(
+            Response::from_body(
+                ResponseBody::Body(
+                    include_bytes!("426.jpg").to_vec()
+                )
+            )?
+            .with_status(426)
+            .with_headers(
+                Headers::from_iter(
+                    [("Content-Type", "image/jpeg")]
+                        .into_iter(),
+                ),
+            ),
+        );
+    }
 
-	spawn_local(async move {
-		let _ = ws_handler(server.as_ref().clone(), env).await;
-	});
+    console_log!("Incoming WebSocket upgrade");
 
-	Response::from_websocket(pair.client)
+    let pair = WebSocketPair::new()?;
+
+    pair.server.accept()?;
+
+    let server = pair.server;
+
+    spawn_local(async move {
+        if let Err(error) =
+            ws_handler(server.as_ref().clone(), env).await
+        {
+            console_warn!(
+                "WebSocket handler failed: {:?}",
+                error
+            );
+        }
+    });
+
+    Response::from_websocket(pair.client)
 }
