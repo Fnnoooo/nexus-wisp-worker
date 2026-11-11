@@ -265,8 +265,7 @@ async fn main(
     _ctx: Context,
 ) -> Result<Response> {
 
-    // NEW: Temporary health-check endpoint
-    // Does not affect existing WebSocket connections.
+    // Health check
     if req.path() == "/health" {
         console_log!("HEALTH CHECK REACHED");
 
@@ -275,6 +274,39 @@ async fn main(
         );
     }
 
+    // Temporary TCP diagnostic
+    if req.path() == "/debug-tcp" {
+        console_log!("TCP diagnostic started");
+
+        let result = Socket::builder()
+            .connect("example.com", 80);
+
+        return match result {
+            Ok(_socket) => {
+                console_log!("TCP socket created");
+
+                Response::ok(
+                    "TCP_SOCKET_CREATED\n\
+                     Cloudflare accepted socket creation.\n\
+                     This does not prove TCP connected."
+                )
+            }
+
+            Err(error) => {
+                console_warn!(
+                    "TCP diagnostic failed: {:?}",
+                    error
+                );
+
+                Response::ok(format!(
+                    "TCP_SOCKET_ERROR\n{:?}",
+                    error
+                ))
+            }
+        };
+    }
+
+    // WebSocket upgrade
     let upgrade = req
         .headers()
         .get("Upgrade")?
